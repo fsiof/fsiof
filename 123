@@ -1,0 +1,492 @@
+import numpy as np
+import math
+from network.model import StyleGAN2_3D
+from pytorch_lightning import seed_everything
+import torchvision
+from utils.utils import ensure_directory, str2bool
+from tqdm import tqdm
+from utils.utils import noise, evaluate_in_chunks, scale_to_unit_sphere, volume_noise, process_sdf, linear_slerp
+import torch
+from utils.render.render import render_mesh
+
+def generate(
+    model_path,
+    output_path="./outputs",
+    ema=True,
+    level=0.03,
+    mc_vol_size =64,
+    num_generate=36,
+    trunc_psi=0.75,
+    random_index=False,
+    render_resolution=1024,
+    deterministic=False
+):
+  model_name, model_id = model_path.split('/')[-2], model_path.split('/')[-1]
+  model = StyleGAN2_3D.load_from_checkpoint(model_path).cuda(0)
+  model.eval()
+  if deterministic:
+      seed_everything(777)
+  print("calculate self.av")
+  z = noise(100000, model.latent_dim, device=model.device)
+  if ema:
+    samples = evaluate_in_chunks(1000, model.SE, z)
+    model.av = torch.mean(samples, dim=0, keepdim=True)
+  else:
+    samples = evaluate_in_chunks(1000, model.S, z)
+    model.av = torch.mean(samples, dim=0, keepdim=True)
+
+  print("start generation")
+  images = []
+  for i in tqdm(range(num_generate)):
+    mesh =  model.generate_mesh(
+      ema=ema, mc_vol_size=mc_vol_size, level=level, trunc_psi=trunc_psi)
+    while mesh is None:
+        mesh = model.generate_mesh(
+      ema=ema, mc_vol_size=mc_vol_size, level=level, trunc_psi=trunc_psi)
+    mesh = scale_to_unit_sphere(mesh)
+    if random_index:
+      index = np.random.randint(20)
+    else:
+      index = 0
+    
+    image = render_mesh(mesh, index=index, resolution=render_resolution)/255
+    image = torch.from_numpy(image.copy()).permute(2, 0, 1)
+    images.append(image)
+
+  name = f'generate_{model_name}_{model_id}_{ema}_{level}_{trunc_psi}'
+  torchvision.utils.save_image(
+      images, output_path + f"/{name}.png", nrow=min(math.ceil(np.sqrt(num_generate)), 15))
+
+
+def generate_mesh(
+    model_path,
+    output_path="./outputs",
+    ema=True,
+    level=0.03,
+    trunc_psi=0.75,
+    mc_vol_size=64,
+    num_generate=10,
+    deterministic=False
+):
+  model_name, model_id = model_path.split('/')[-2], model_path.split('/')[-1]
+  model = StyleGAN2_3D.load_from_checkpoint(model_path).cuda(0)
+  model.eval()
+  if deterministic:
+      seed_everything(777)
+  print("calculate self.av")
+  z = noise(100000, model.latent_dim, device=model.device)
+  if ema:
+    samples = evaluate_in_chunks(1000, model.SE, z)
+    model.av = torch.mean(samples, dim=0, keepdim=True)
+  else:
+    samples = evaluate_in_chunks(1000, model.S, z)
+    model.av = torch.mean(samples, dim=0, keepdim=True)
+  print("start generation")
+  for i in tqdm(range(num_generate)):
+    mesh = model.generate_mesh(
+        ema=ema, mc_vol_size=mc_vol_size, level=level, trunc_psi=trunc_psi)
+    mesh = scale_to_unit_sphere(mesh)
+    name = f'/generate_{model_name}_{model_id}_{ema}_{level}_{mc_vol_size}_{trunc_psi}_{i}.obj'
+    mesh.export(output_path + name)
+
+
+def generate_interpolation(
+    model_path,
+    output_path="./outputs",
+    ema=True,
+    level=0.03,
+    vol_size=64,
+    render_resolution=1024,
+    interpolation_num_steps=16,
+    trunc_psi=0.75,
+    view_index=5,
+    rows=1,
+    deterministic=False
+):
+  model_name, model_id = model_path.split('/')[-2], model_path.split('/')[-1]
+  model = StyleGAN2_3D.load_from_checkpoint(model_path).cuda(0)
+  model.eval()
+  if deterministic:
+    seed_everything(777)
+  print("calculate self.av")
+  z = noise(100000, model.latent_dim, device=model.device)
+  if ema:
+    samples = evaluate_in_chunks(1000, model.SE, z)
+    model.av = torch.mean(samples, dim=0, keepdim=True)
+  else:
+    samples = evaluate_in_chunks(1000, model.S, z)
+    model.av = torch.mean(samples, dim=0, keepdim=True)
+  print("start generation")
+  n = volume_noise(1, model.G_vol_size, device=model.device)
+
+  interpolation_num_steps = 40
+  for i in tqdm(range(rows)):
+    images = []
+    latents_low = noise(1, model.latent_dim, device=model.device)
+    latents_high = noise(1, model.latent_dim, device=model.device)
+
+    ratios = torch.linspace(0., 1., interpolation_num_steps)
+    for j in range(interpolation_num_steps):
+      ratio = ratios[j]
+      interp_latents = linear_slerp(ratio, latents_low, latents_high)
+      latents = [(interp_latents, model.num_layers)]
+      points = model.get_voxel_coordinates(resolution=vol_size)
+      
+      generated_voxels = model.generate_truncated(
+          model.SE, model.GE, latents, n, trunc_psi=trunc_psi)
+      sdf = model.ME(points, generated_voxels).view(
+          vol_size, vol_size, vol_size) - level
+      
+      mesh = scale_to_unit_sphere(
+          process_sdf(sdf.cpu().numpy(), level=level))
+      image = render_mesh(mesh, index=view_index, resolution=render_resolution)/255
+      image = torch.from_numpy(image.copy()).permute(2, 0, 1)
+      images.append(image)
+      
+  name = f'interpolation_{rows}_{interpolation_num_steps}_{model_name}_{model_id}_{ema}_{level}_{trunc_psi}_{view_index}'
+  torchvision.utils.save_image(
+    images, output_path + f"/{name}.png", nrow=interpolation_num_steps)
+
+
+if __name__ == '__main__':
+  import argparse
+  parser = argparse.ArgumentParser(description='generate something')
+
+  parser.add_argument("--generate_method", type=str, default='generate',
+                      help="please choose :\n \
+                       1. 'generate' \n \
+                       2. 'generate_interpolation' \n \
+                       3. 'generate_mesh'")
+
+  parser.add_argument("--model_path", type=str, required=True)
+  parser.add_argument("--output_path", type=str, default="./outputs")
+  parser.add_argument("--ema", type=str2bool, default=True)
+  parser.add_argument("--level", type=float, default=-0.015)
+  parser.add_argument("--num_generate", type=int, default=100)
+  parser.add_argument("--interpolation_num_steps", type=int, default=10)
+  parser.add_argument("--interpolation_rows", type=int, default=10)
+  parser.add_argument("--trunc_psi", type=float, default=1.0)
+  parser.add_argument("--shading_method", type=str, default="normal")
+  parser.add_argument("--view_index", type=int, default=1)
+  parser.add_argument("--col_num", type=int, default=10)
+  parser.add_argument("--mc_vol_size", type=int, default=128)
+  parser.add_argument("--random_index", type=str2bool, default=False)
+  parser.add_argument("--render_resolution", type=int, default=1024)
+  parser.add_argument("--deterministic", type=str2bool, default=False)
+
+  args = parser.parse_args()
+  method = (args.generate_method).lower()
+  ensure_directory(args.output_path)
+  if method == "generate":
+    generate(model_path=args.model_path, output_path=args.output_path, ema=args.ema, level=args.level, mc_vol_size=args.mc_vol_size, num_generate=args.num_generate,
+             trunc_psi=args.trunc_psi,random_index=args.random_index, render_resolution=args.render_resolution, deterministic=args.deterministic)
+  elif method == "generate_interpolation":
+    generate_interpolation(model_path=args.model_path, output_path=args.output_path, ema=args.ema, level=args.level, vol_size=args.mc_vol_size, interpolation_num_steps=args.interpolation_num_steps,
+                           trunc_psi=args.trunc_psi, view_index=args.view_index, rows=args.interpolation_rows,render_resolution=args.render_resolution, deterministic=args.deterministic)
+  elif method == "generate_mesh":
+    generate_mesh(model_path=args.model_path, output_path=args.output_path, ema=args.ema,
+                  level=args.level, trunc_psi=args.trunc_psi, mc_vol_size=args.mc_vol_size,num_generate=args.num_generate, deterministic=args.deterministic)
+  else:
+    raise NotImplementedError
+
+from network.model import StyleGAN2_3D
+from utils.render_utils import generate_image_for_fid
+from utils.utils import noise, evaluate_in_chunks
+import torch
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument("--model_path", type=str, required=True)
+args = parser.parse_args()
+
+
+
+model_path = args.model_path
+fid_root = "./fid_temp"
+
+model = StyleGAN2_3D.load_from_checkpoint(model_path).cuda(0)
+model.eval()
+z = noise(100000, model.latent_dim, device=model.device)
+samples = evaluate_in_chunks(1000, model.SE, z)
+model.av = torch.mean(samples, dim=0, keepdim=True)
+
+
+
+mesh = model.generate_mesh(
+    ema=True, mc_vol_size=128, level=-0.015, trunc_psi=1.0)
+generate_image_for_fid(mesh,fid_root)
+
+
+
+MIT License
+
+Copyright (c) 2022 Zhengxinyang
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+# SDF-StyleGAN: Implicit SDF-Based StyleGAN for 3D Shape Generation (SGP 2022)
+
+This repository contains the core implementation of our paper:
+
+**[SDF-StyleGAN: Implicit SDF-Based StyleGAN for 3D Shape Generation](https://zhengxinyang.github.io/projects/SDF_stylegan.html)**
+<br>
+[Xin-Yang Zheng](https://zhengxinyang.github.io/),
+[Yang Liu](https://xueyuhanlang.github.io/),
+[Peng-Shuai Wang](https://wang-ps.github.io/),
+[Xin Tong](https://www.microsoft.com/en-us/research/people/xtong/).
+<br>
+<br>
+
+![teaser](teaser_full.png)
+
+## Installation
+
+Following is the suggested way to install the dependencies of our code:
+
+```
+conda create --name stylegan python=3.8
+conda activate stylegan
+conda install pytorch==1.8.0 torchvision==0.9.0 torchaudio==0.8.0 cudatoolkit=11.1 -c pytorch -c conda-forge
+pip install fire scikit-image==0.18.2 scikit-learn==0.24.2 trimesh kornia==0.5.8 pyglet pyrender pyrr
+pip install pytorch-lightning==1.5.1
+```
+
+## Data Preparation
+
+### Data creation
+
+Our SDF field training data was generated by following the pipepline described in the paper <a href="https://github.com/microsoft/DualOctreeGNN" target="_blank">DualOctreeGNN</a>. Please ref to <a href="https://github.com/microsoft/DualOctreeGNN#21-data-preparation" target="_blank">its script</a> for generating the SDF field from ShapeNet data or your customized data.
+
+### Preprocessed Data
+
+Our training data is also available (total 165G+).
+Here is <a href="https://pan.baidu.com/s/1nVS7wlcOz62nYBgjp_M8Yg?pwd=oj1b">the link</a>.
+
+## Usage
+
+### Train from Scratch
+
+Please modify the data path in the scripts, then run
+
+```
+bash scripts/train_{DATA_CLASS}.sh
+```
+
+### Shape Generation
+
+We provide the pretrained models in <a href="https://drive.google.com/drive/folders/1pbtileaz2eMAiP2uK_u22c3JyhGq-WVC?usp=sharing" target="_blank">here</a>. You can download them and modify the model path in the scripts, then run
+
+```
+bash scripts/generate_{DATA_CLASS}.sh
+```
+
+### Shading image based FID computation
+
+You can try the demo that generates images for FID calculation. Please refer to our paper for more technical details.
+
+```
+python generate_for_fid.py --model_path {YOU_MODEL_PATH}
+```
+
+<!-- ## Other evaluation Metrics
+Please ref to
+<a href="https://github.com/jtpils/TreeGAN" target="_blank">TreeGAN</a>, <a href="https://github.com/AnTao97/dgcnn.pytorch" target="_blank">DGCNN</a>, <a href="https://github.com/stevenygd/PointFlow" target="_blank">PointFlow</a>, <a href="https://github.com/Sunwinds/ShapeDescriptor" target="_blank">ShapeDescriptor</a> and <a href="https://github.com/GaParmar/clean-fid" target="_blank">Clean-FID</a> -->
+
+## Acknowledgements
+
+We use the following third-party codes.
+
+- <a href="https://github.com/Hippogriff/rendering" target="_blank">https://github.com/Hippogriff/rendering</a>
+- <a href="https://github.com/lucidrains/stylegan2-pytorch" target="_blank">https://github.com/lucidrains/stylegan2-pytorch</a>
+- <a href=" https://github.com/NVlabs/stylegan2-ada-pytorch" target="_blank"> https://github.com/NVlabs/stylegan2-ada-pytorch</a>
+
+## Citation
+
+If you find our work useful in your research, please consider citing:
+
+```
+@inproceedings{zheng2022sdfstylegan,
+  title = {SDF-StyleGAN: Implicit SDF-Based StyleGAN for 3D Shape Generation},
+  author = {Zheng, Xin-Yang and Liu, Yang and Wang, Peng-Shuai and Tong, Xin},
+  booktitle = {Comput. Graph. Forum (SGP)},
+  year = {2022},
+}
+```
+
+import fire
+import os
+from network.model import StyleGAN2_3D
+from pytorch_lightning import Trainer
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning import seed_everything
+from pytorch_lightning.plugins import DDPPlugin
+from pytorch_lightning import loggers as pl_loggers
+from utils.utils import ensure_directory, run
+
+
+def train_from_folder(
+    data,
+    results_dir='./runs',
+    name='default',
+    G_vol_size=32,
+    D_vol_size=32,
+    fine_D_vol_size=128,
+    latent_dim=512,
+    style_depth=8,
+    G_feature_dim=16,
+    mlp_network_depth=2,
+    mlp_latent_dim=128,
+    network_capacity=16,
+    G_fmap_max=256,
+    D_fmap_max=256,
+    surface_level=-0.015,
+    batch_size=4,
+    learning_rate=1e-4,
+    lr_mlp=0.1,
+    global_D_lr_mul=1.5,
+    local_D_lr_mul=1.5,
+    pl_loss_weight=2.0,
+    local_patch_loss_weight=1,
+    use_global_normal=True,
+    apply_gradient_normalization=True,
+    use_patch=True,
+    local_use_sdf=True,
+    local_use_normal=True,
+    local_patch_res=16,
+    local_patch_number=16,
+    local_patch_center_candidate_number=4096,
+    r1_gamma=10,
+    training_epoch=200,
+    mixed_prob=0.9,
+    new=False,
+    continue_training=True,
+    debug=False,
+    verbose=False,
+    adaptive_local=True,
+    offset_center=False,
+    save_image=False,
+    seed=777
+):
+  results_dir = results_dir + "/" + name
+  ensure_directory(results_dir)
+
+  if continue_training:
+    new = False
+  if debug and new:
+    new = True
+
+  if new:
+    run(f"rm -rf {results_dir}/*")
+
+  model_args = dict(
+      results_dir=results_dir,
+      data=data,
+      batch_size=batch_size,
+      latent_dim=latent_dim,
+      style_depth=style_depth,
+      surface_level=surface_level,
+      G_feature_dim=G_feature_dim,
+      G_vol_size=G_vol_size,
+      global_D_lr_mul=global_D_lr_mul,
+      local_D_lr_mul=local_D_lr_mul,
+      D_vol_size=D_vol_size,
+      fine_D_vol_size=fine_D_vol_size,
+      use_patch=use_patch,
+      use_global_normal=use_global_normal,
+      local_use_sdf=local_use_sdf,
+      local_use_normal=local_use_normal,
+      local_patch_res=local_patch_res,
+      local_patch_number=local_patch_number,
+      apply_gradient_normalization=apply_gradient_normalization,
+      local_patch_center_candidate_number=local_patch_center_candidate_number,
+      mlp_network_depth=mlp_network_depth,
+      mlp_latent_dim=mlp_latent_dim,
+      network_capacity=network_capacity,
+      G_fmap_max=G_fmap_max,
+      D_fmap_max=D_fmap_max,
+      learning_rate=learning_rate,
+      lr_mlp=lr_mlp,
+      pl_loss_weight=pl_loss_weight,
+      local_patch_loss_weight=local_patch_loss_weight,
+      r1_gamma=r1_gamma,
+      mixed_prob=mixed_prob,
+      view_index=2,
+      verbose=verbose,
+      save_image=save_image,
+      adaptive_local=adaptive_local,
+      offset_center=offset_center,
+      training_epoch=training_epoch
+  )
+
+  seed_everything(seed)
+
+  model = StyleGAN2_3D(**model_args)
+
+  log_dir = results_dir
+
+  tb_logger = pl_loggers.TensorBoardLogger(
+      save_dir=log_dir,
+      version=None,
+      name='logs',
+      default_hp_metric=False
+  )
+
+  checkpoint_callback = ModelCheckpoint(
+      monitor="current_epoch",
+      dirpath=results_dir,
+      filename="{epoch:02d}",
+      save_top_k=40,
+      save_last=True,
+      every_n_epochs=10,
+      mode="max",
+  )
+
+  if debug:
+    if continue_training and os.path.exists(results_dir + '/last.ckpt'):
+      trainer = Trainer(devices=-1,
+                        accelerator="gpu",
+                        strategy=DDPPlugin(find_unused_parameters=False),
+                        logger=tb_logger,
+                        max_epochs=training_epoch,
+                        log_every_n_steps=1,
+                        callbacks=[checkpoint_callback],
+                        overfit_batches=0.005,
+                        resume_from_checkpoint=results_dir + '/last.ckpt')
+    else:
+      trainer = Trainer(devices=-1,
+                        accelerator="gpu",
+                        strategy=DDPPlugin(find_unused_parameters=False),
+                        logger=tb_logger,
+                        max_epochs=training_epoch,
+                        log_every_n_steps=1,
+                        callbacks=[checkpoint_callback],
+                        overfit_batches=0.005)
+  else:
+    trainer = Trainer(devices=-1,
+                      accelerator="gpu",
+                      strategy=DDPPlugin(find_unused_parameters=False),
+                      logger=tb_logger,
+                      max_epochs=training_epoch,
+                      log_every_n_steps=1,
+                      callbacks=[checkpoint_callback])
+
+  trainer.fit(model)
+
+
+if __name__ == '__main__':
+  fire.Fire(train_from_folder)
